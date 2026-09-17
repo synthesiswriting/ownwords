@@ -29,3 +29,7 @@ coverage/
 
 # Personal Claude Code context (managed via mac-sync)
 CLAUDE.local.md
+
+# Distribution build bytecode and release output
+__pycache__/
+dist/

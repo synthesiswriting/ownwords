@@ -19,6 +19,25 @@
 
 const fs = require('fs');
 const path = require('path');
+// Setup and lifecycle management are explicit distribution actions. Dispatch before loading article,
+// account or API modules; normal commands never import the setup adapter.
+if (['setup', 'synthesis'].includes(process.argv[2])) {
+  try {
+    const { runSetup, runSynthesis } = require('../lib/setup');
+    const run = process.argv[2] === 'setup' ? runSetup : runSynthesis;
+    Promise.resolve(run(process.argv.slice(3))).then(code => {
+      process.exitCode = code;
+    }).catch(error => {
+      console.error(`Error: ${error.message}`);
+      process.exitCode = 1;
+    });
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
+  }
+  return;
+}
+
 const readline = require('readline');
 const { fetchArticle, extractSlugFromUrl, extractDateFromUrl } = require('../lib/fetch');
 const { convertFile } = require('../lib/convert');
@@ -74,6 +93,8 @@ WordPress to Markdown conversion toolkit for human authors.
 Usage: ownwords <command> [options]
 
 Commands:
+  setup [--no-dormant-core]      Stage optional dormant Synthesis assets
+  synthesis <command> [args]    Explicit Synthesis lifecycle management
   fetch <url> [output]           Fetch a WordPress article as HTML
   convert <input> [output]       Convert HTML file to Markdown
   verify <html> <markdown>       Verify conversion quality

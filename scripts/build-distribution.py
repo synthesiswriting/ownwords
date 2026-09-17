@@ -183,10 +183,13 @@ def build(source, output, core_archive, core_sha256, npm_cache=None, source_iden
   sha256 "%s"
   license "MIT"
   depends_on "node"
+  depends_on "git"
+  depends_on "python@3.12"
   def install
     libexec.install Dir["*"]
     (bin/"ownwords").write_env_script libexec/"bin/ownwords.js",
-      PATH: "#{Formula["node"].opt_bin}:#{ENV["PATH"]}"
+      PATH: "#{Formula["node"].opt_bin}:#{ENV["PATH"]}",
+      SYNTHESIS_BOOTSTRAP_PYTHON: "#{Formula["python@3.12"].opt_bin}/python3.12"
   end
   test do
     assert_match "ownwords v%s", shell_output("#{bin}/ownwords --version")

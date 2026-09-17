@@ -10,6 +10,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 SPEC=importlib.util.spec_from_file_location('ownwords_distribution',Path(__file__).with_name('build-distribution.py'))
 builder=importlib.util.module_from_spec(SPEC)
@@ -91,6 +92,41 @@ class Packaging(unittest.TestCase):
         self.assertIn('test "$(npm --version)" = "11.15.0"',text)
         self.assertLess(text.index('npm@11.15.0'),text.index('npm publish '))
         self.assertNotIn('NODE_AUTH_TOKEN:',text)
+
+    def test_homebrew_formula_declares_and_pins_explicit_setup_prerequisites(self):
+        source=self.root/'source';source.mkdir()
+        for directory in ('bin','lib','types','docs','packages'):
+            (source/directory).mkdir()
+        metadata={'name':'ownwords','version':'9.8.7','dependencies':{},'files':['bin/','lib/']}
+        (source/'package.json').write_text(json.dumps(metadata))
+        (source/'package-lock.json').write_text(json.dumps({'name':'ownwords','version':'9.8.7','lockfileVersion':3,'packages':{'':metadata}}))
+        for name in ('README.md','LICENSE','bin/ownwords.js','lib/index.js','types/index.d.ts','docs/distribution.md'):
+            (source/name).write_text('fixture only\n')
+        (source/'packages/install.sh').write_text('#!/bin/sh\n# @VERSION@ @ARCHIVE_SHA256@\n')
+        bootstrap=b'#!/bin/sh\nexit 0\n'
+        release={'schema_version':1,'version':'9.8.7','commit':'1'*40,'bootstrap_sha256':hashlib.sha256(bootstrap).hexdigest()}
+        files={'bin/synthesis':bootstrap,'lib/onboard.sh':bootstrap,'lib/package_launcher.py':b'# fixture\n',
+               'lib/release_runtime.py':b'# fixture\n','lib/release.json':json.dumps(release).encode(),
+               'LICENSE':b'fixture\n','README.md':b'fixture\n','package.json':b'{}\n'}
+        core=self.root/'core.tgz'
+        with tarfile.open(core,'w:gz') as archive:
+            for name,data in files.items():
+                member=tarfile.TarInfo('synthesis/'+name);member.size=len(data)
+                member.mode=0o755 if name=='bin/synthesis' else 0o644
+                archive.addfile(member,io.BytesIO(data))
+        output=self.root/'output'
+        # This renderer fixture has no dependencies. The full distribution
+        # consumer suite separately exercises real locked npm acquisition.
+        with mock.patch.object(builder.subprocess,'run',return_value=subprocess.CompletedProcess([],0)) as npm:
+            builder.build(source,output,core,hashlib.sha256(core.read_bytes()).hexdigest())
+        npm.assert_called_once()
+        formula=(output/'ownwords.rb').read_text()
+        self.assertIn('depends_on "node"',formula)
+        self.assertIn('depends_on "git"',formula)
+        self.assertIn('depends_on "python@3.12"',formula)
+        self.assertIn('PATH: "#{Formula["node"].opt_bin}:#{ENV["PATH"]}"',formula)
+        self.assertIn('SYNTHESIS_BOOTSTRAP_PYTHON: "#{Formula["python@3.12"].opt_bin}/python3.12"',formula)
+        self.assertEqual(json.loads((output/'package/package.json').read_text())['dependencies'],{})
 
 
 if __name__=='__main__':

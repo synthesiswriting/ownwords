@@ -1,0 +1,97 @@
+name: Verified distribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing exact Ownwords version tag
+        required: true
+      core_archive_url:
+        description: Exact published synthesis-skills release archive URL
+        required: true
+      core_archive_sha256:
+        description: Verified SHA-256 of that core archive
+        required: true
+      publish:
+        description: Publish the tested package to npm and upload release assets
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  distribution:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Select verified npm trusted-publishing toolchain
+        run: |
+          npm install --global npm@11.15.0 --ignore-scripts --no-audit --no-fund
+          test "$(npm --version)" = "11.15.0"
+          node -e 'const [major,minor]=process.versions.node.split(".").map(Number);if(major<22||(major===22&&minor<14))process.exit(1)'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: oven-sh/setup-bun@v2
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run lint && npm test
+      - name: Acquire checksum-bound core archive
+        env:
+          CORE_URL: ${{ inputs.core_archive_url }}
+          CORE_SHA: ${{ inputs.core_archive_sha256 }}
+        run: |
+          python3 - <<'PYVALIDATE'
+          import os, re
+          assert re.fullmatch(r'https://github.com/synthesisengineering/synthesis-skills/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/synthesis-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz', os.environ['CORE_URL'])
+          assert re.fullmatch(r'[a-f0-9]{64}', os.environ['CORE_SHA'])
+          PYVALIDATE
+          curl --fail --location --proto '=https' --tlsv1.2 "$CORE_URL" -o "$RUNNER_TEMP/core.tar.gz"
+      - name: Build exact-tag artifacts
+        env:
+          CORE_SHA: ${{ inputs.core_archive_sha256 }}
+        run: >-
+          python3 -B scripts/build-distribution.py
+          --output "$RUNNER_TEMP/ownwords-dist"
+          --core-archive "$RUNNER_TEMP/core.tar.gz"
+          --core-sha256 "$CORE_SHA"
+          --npm-cache "$HOME/.npm"
+      - name: Verify npm, Bun, direct and curl consumers
+        env:
+          CORE_SHA: ${{ inputs.core_archive_sha256 }}
+        run: >-
+          python3 -B scripts/test-distribution.py
+          --core-archive "$RUNNER_TEMP/core.tar.gz"
+          --core-sha256 "$CORE_SHA"
+          --npm-cache "$HOME/.npm"
+          --output "$RUNNER_TEMP/ownwords-consumers"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ownwords-distribution
+          path: |
+            ${{ runner.temp }}/ownwords-dist/*.tgz
+            ${{ runner.temp }}/ownwords-dist/SHA256SUMS
+            ${{ runner.temp }}/ownwords-dist/distribution.json
+            ${{ runner.temp }}/ownwords-dist/ownwords.rb
+            ${{ runner.temp }}/ownwords-dist/install.sh
+            ${{ runner.temp }}/ownwords-consumers/acceptance.json
+      - name: Publish verified release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          test "$RELEASE_TAG" = "v$VERSION"
+          npm publish "$RUNNER_TEMP/ownwords-dist/ownwords-$VERSION.tgz" --provenance --access public
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/ownwords-dist/ownwords-$VERSION.tgz" "$RUNNER_TEMP/ownwords-dist/SHA256SUMS" "$RUNNER_TEMP/ownwords-dist/distribution.json" "$RUNNER_TEMP/ownwords-dist/ownwords.rb" "$RUNNER_TEMP/ownwords-dist/install.sh"

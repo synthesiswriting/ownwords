@@ -62,15 +62,94 @@ The Agent API includes `dryRun` support for all batch operations, so you can pre
 
 ## Installation
 
-```bash
-npm install ownwords
-```
-
-Or use directly via npx:
+Ownwords runs on Node.js 18 or later. Install the CLI with npm or Bun:
 
 ```bash
-npx ownwords --help
+npm install -g ownwords
+# or
+bun add -g ownwords
 ```
+
+Homebrew uses the same checksum-bound release archive:
+
+```bash
+brew install synthesisengineering/tap/ownwords
+```
+
+The versioned shell installer verifies its exact release archive before installing
+under `~/.local/bin` and explicitly running optional dormant-core setup:
+
+```bash
+curl -fsSL https://github.com/synthesiswriting/ownwords/releases/download/v1.6.0/install.sh | sh
+```
+
+It requires Node.js 18+, Python 3.9+ and curl. Default dormant setup additionally
+requires Git and Python 3.12–3.14. To install Ownwords while declining that
+optional acquisition, use:
+
+```bash
+curl -fsSL https://github.com/synthesiswriting/ownwords/releases/download/v1.6.0/install.sh | sh -s -- --no-dormant-core
+```
+
+Use `--prefix /absolute/path` to choose another installation directory. Unknown
+launchers, changed release files, permission drift and unrecognized recovery
+records are preserved and cause failure. Earlier version directories remain.
+
+To use Ownwords as a library, install it locally with `npm install ownwords`.
+The published npm package, Bun package and direct release archive include the
+locked production dependencies. Bun may still query the npm registry while
+installing those exact dependency versions. Package manager installation runs no setup scripts and
+does not configure agents, services, WordPress accounts or AI providers.
+
+For a direct installation, download the versioned archive and `SHA256SUMS` from
+[GitHub releases](https://github.com/synthesiswriting/ownwords/releases), verify
+its SHA-256, then extract it. Run `node package/bin/ownwords.js --help` from the
+extracted directory. The archive contains portable JavaScript and its production
+dependencies; it is not a native executable. An AUR package is not published.
+
+### Optional Synthesis setup
+
+Ownwords' authoring commands work independently. Explicit setup stages shared
+Synthesis assets outside agent discovery, without activating a workspace,
+native plugin, hook or service:
+
+```bash
+ownwords setup
+```
+
+This optional operation requires Git and Python 3.12, 3.13 or 3.14. It uses the
+checksum-inventoried thin launcher bundled with the Ownwords release and fetches
+that launcher's exact core version and commit. It records release provenance
+and consumes download bandwidth and disk space. It does not call an LLM or add
+anything to a model's context.
+
+To decline optional staging:
+
+```bash
+ownwords setup --no-dormant-core --json
+```
+
+The declined path requires Python 3.9 or later, performs no acquisition or state
+writes, and preserves any earlier staged assets or independent installation.
+Ordinary commands and package postinstall never invoke setup. Explicit
+`ownwords synthesis activate --profile full` or
+`ownwords synthesis activate --profile skills-only` can activate
+verified staged assets through the shared lifecycle engine.
+
+Setup does not read article files, WordPress credentials or AI API keys, and it
+does not send content to WordPress or an AI provider. Core downloads contact
+GitHub. Authoring commands that explicitly fetch, publish or call an AI provider
+retain their documented network and credential behavior. There is no telemetry
+or background updater in the setup integration.
+
+The explicit bridge also exposes `ownwords synthesis status`, `doctor`, `repair`,
+`update` and `deactivate`. Arguments are forwarded to the pinned core launcher,
+and failures or termination signals propagate to the caller. Cancellation is forwarded to the running child process group and the caller waits for it to stop. The shell installer applies the same rule to downloads and optional setup. These lifecycle
+commands can inspect or change the Synthesis installation only when you invoke
+them; they do not run article, WordPress or AI operations.
+
+See [distribution maintenance](docs/distribution.md) for exact release binding,
+package checksums, consumer acceptance and publication steps.
 
 ## CLI Usage
 

@@ -1,6 +1,6 @@
 {
   "name": "ownwords",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Own your words. Bi-directional WordPress sync, local Markdown editing, batch AI-assisted editorial operations, and dual publishing to both WordPress and static sites.",
   "main": "lib/index.js",
   "types": "types/index.d.ts",

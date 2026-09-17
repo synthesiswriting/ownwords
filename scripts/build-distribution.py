@@ -123,8 +123,92 @@ def materialize_release(source, destination):
     return {'kind':'git','url':SOURCE,'commit':commit,'tag':'v'+version}
 
 
-def build(source, output, core_archive, core_sha256, npm_cache=None, source_identity=None):
+def render_formula(version, checksum, revision=0):
+    """Render a recipe independently from its immutable release payload."""
+    if not re.fullmatch(r'\d+\.\d+\.\d+', str(version)) or not re.fullmatch(r'[a-f0-9]{64}', str(checksum)):
+        raise ValueError('formula requires exact version and archive checksum')
+    if type(revision) is not int or revision < 0:
+        raise ValueError('formula revision must be a non-negative integer')
+    url = SOURCE + '/releases/download/v' + version + '/ownwords-' + version + '.tgz'
+    return '''class Ownwords < Formula
+  desc "Own your words: portable WordPress and Markdown authoring tools"
+  homepage "https://github.com/synthesiswriting/ownwords"
+  url "%s"
+  sha256 "%s"
+%s  license "MIT"
+  depends_on "node"
+  depends_on "git"
+  depends_on "python@3.12"
+  def install
+    libexec.install Dir["*"]
+    (bin/"ownwords").write_env_script libexec/"bin/ownwords.js",
+      PATH: "#{Formula["node"].opt_bin}:#{Formula["git"].opt_bin}:$PATH",
+      SYNTHESIS_BOOTSTRAP_PYTHON: "#{Formula["python@3.12"].opt_bin}/python3.12"
+  end
+  test do
+    assert_match "ownwords v%s", shell_output("#{bin}/ownwords --version")
+    assert_match "setup", shell_output("#{bin}/ownwords --help")
+  end
+end
+''' % (url, checksum, ('  revision %d\n' % revision) if revision else '', version)
+
+
+def formula_from_published(distribution, archive, output, revision=0):
+    """Emit a new recipe for verified existing bytes, without rebuilding them."""
+    regular(distribution); regular(archive)
+    metadata = json.loads(distribution.read_text())
+    version = metadata.get('version'); checksum = metadata.get('sha256')
+    formula = render_formula(version, checksum, revision)
+    if sha(archive) != checksum:
+        raise ValueError('published archive checksum mismatch')
+    expected_name = 'ownwords-' + version + '.tgz'
+    source = metadata.get('source', {})
+    if (metadata.get('archive') != expected_name or archive.name != expected_name
+            or metadata.get('url') != SOURCE + '/releases/download/v' + version + '/' + expected_name
+            or source.get('kind') != 'git' or source.get('url') != SOURCE
+            or source.get('tag') != 'v' + version
+            or not re.fullmatch(r'[a-f0-9]{40}', str(source.get('commit')))):
+        raise ValueError('published payload identity is inconsistent')
+    with tarfile.open(archive, 'r:gz') as tar:
+        package = [m for m in tar.getmembers() if m.name == 'package/package.json']
+        if len(package) != 1 or not package[0].isfile():
+            raise ValueError('published archive package identity is missing or ambiguous')
+        manifest = json.load(tar.extractfile(package[0]))
+        if manifest.get('name') != 'ownwords' or manifest.get('version') != version:
+            raise ValueError('published archive version does not match metadata')
+    if '..' in output.parts:
+        raise ValueError('distribution output cannot contain parent traversal')
+    output = output.absolute()
+    if output == ROOT or ROOT in output.parents or output in ROOT.parents:
+        raise ValueError('formula output must be outside the source checkout')
+    if output.exists():
+        raise ValueError('formula output must be a new directory')
+    for ancestor in (output, *output.parents):
+        if ancestor.is_symlink() and ancestor not in {Path('/tmp'), Path('/var')}:
+            raise ValueError('formula output crosses a symbolic link')
+    recipe = Path(__file__).resolve()
+    # A dirty candidate is explicitly identified, never represented as its base
+    # commit's released bytes. A committed recipe records its independent OID.
+    commit = subprocess.check_output(['git','rev-parse','HEAD^{commit}'],cwd=ROOT,text=True).strip()
+    dirty = bool(subprocess.check_output(['git','status','--porcelain','--untracked-files=all'],cwd=ROOT,text=True).strip())
+    result = {'schema_version': 1, 'formula_revision': revision, 'formula_version': version + ('_%d' % revision if revision else ''),
+              'archive': expected_name, 'archive_url': metadata['url'], 'archive_sha256': checksum,
+              'payload_source': source, 'distribution_sha256': sha(distribution),
+              'recipe_source': {'kind': 'working-tree' if dirty else 'git', 'url': SOURCE, 'commit': commit,
+                                'file': 'scripts/build-distribution.py', 'file_sha256': sha(recipe)},
+              'formula_sha256': hashlib.sha256(formula.encode()).hexdigest()}
+    output.mkdir(parents=True)
+    (output / 'ownwords.rb').write_text(formula)
+    (output / 'formula-provenance.json').write_text(json.dumps(result, indent=2) + '\n')
+    return result
+
+
+def build(source, output, core_archive, core_sha256, npm_cache=None, source_identity=None, formula_revision=0):
+    if type(formula_revision) is not int or formula_revision < 0:
+        raise ValueError('formula revision must be a non-negative integer')
     source = source.resolve()
+    if '..' in output.parts:
+        raise ValueError('distribution output cannot contain parent traversal')
     output = output.absolute()
     if output == source or source in output.parents or output in source.parents:
         raise ValueError('distribution output must be outside the source checkout')
@@ -176,30 +260,10 @@ def build(source, output, core_archive, core_sha256, npm_cache=None, source_iden
     installer_checksum = sha(installer)
     (output / 'SHA256SUMS').write_text(checksum + '  ' + artifact.name + '\n' + installer_checksum + '  install.sh\n')
     url = SOURCE + '/releases/download/v' + version + '/' + artifact.name
-    formula = '''class Ownwords < Formula
-  desc "Own your words: portable WordPress and Markdown authoring tools"
-  homepage "https://github.com/synthesiswriting/ownwords"
-  url "%s"
-  sha256 "%s"
-  license "MIT"
-  depends_on "node"
-  depends_on "git"
-  depends_on "python@3.12"
-  def install
-    libexec.install Dir["*"]
-    (bin/"ownwords").write_env_script libexec/"bin/ownwords.js",
-      PATH: "#{Formula["node"].opt_bin}:#{ENV["PATH"]}",
-      SYNTHESIS_BOOTSTRAP_PYTHON: "#{Formula["python@3.12"].opt_bin}/python3.12"
-  end
-  test do
-    assert_match "ownwords v%s", shell_output("#{bin}/ownwords --version")
-    assert_match "setup", shell_output("#{bin}/ownwords --help")
-  end
-end
-''' % (url, checksum, version)
+    formula = render_formula(version, checksum, formula_revision)
     (output / 'ownwords.rb').write_text(formula)
     result = {'schema_version': 1, 'version': version, 'archive': artifact.name, 'sha256': checksum,
-              'url': url, 'npm_package': 'ownwords', 'brew_formula': 'synthesisengineering/tap/ownwords',
+              'formula_revision': formula_revision, 'url': url, 'npm_package': 'ownwords', 'brew_formula': 'synthesisengineering/tap/ownwords',
               'core': {key: core[key] for key in ('version', 'commit', 'archive_sha256')},
               'source': source_identity or {'kind':'fixture'},
               'channels': ['curl', 'npm', 'bun', 'homebrew', 'direct'], 'aur': 'not-published',
@@ -212,10 +276,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo-root', type=Path, default=ROOT)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--core-archive', type=Path, required=True)
-    parser.add_argument('--core-sha256', required=True)
+    parser.add_argument('--core-archive', type=Path)
+    parser.add_argument('--core-sha256')
+    parser.add_argument('--formula-revision', type=int, default=0, help='Homebrew recipe revision; new payload releases default to 0')
+    parser.add_argument('--formula-from-distribution', type=Path, help='Generate only a formula for this existing published distribution metadata')
+    parser.add_argument('--published-archive', type=Path, help='Exact unchanged payload required by formula-only generation')
     parser.add_argument('--npm-cache', type=Path)
     args = parser.parse_args()
+    if args.formula_from_distribution:
+        if not args.published_archive or args.core_archive or args.core_sha256 or args.npm_cache:
+            parser.error('formula-only requires --published-archive and cannot rebuild core or npm payloads')
+        print(json.dumps(formula_from_published(args.formula_from_distribution, args.published_archive, args.output, args.formula_revision), indent=2))
+        return
+    if args.published_archive or not args.core_archive or not args.core_sha256:
+        parser.error('full build requires --core-archive and --core-sha256')
     source = args.repo_root.resolve()
     output=args.output.absolute()
     if output==source or source in output.parents or output in source.parents:
@@ -223,7 +297,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='ownwords-release-') as temporary:
         snapshot=Path(temporary)/'source'
         identity=materialize_release(source,snapshot)
-        print(json.dumps(build(snapshot,args.output,args.core_archive,args.core_sha256,args.npm_cache,identity),indent=2))
+        print(json.dumps(build(snapshot,args.output,args.core_archive,args.core_sha256,args.npm_cache,identity,args.formula_revision),indent=2))
 
 
 if __name__ == '__main__':

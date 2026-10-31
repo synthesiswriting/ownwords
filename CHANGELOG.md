@@ -146,7 +146,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [2.0.0] - Unreleased
+## [2.0.0] - 2026-10-30
 
 Ownwords installs and runs as a standalone tool. Version 1.6.0 bundled the core package of the 4.x synthesis work system and added commands to stage and manage it; this release removes that package and those commands from the tool and from every distribution channel. For the current synthesis work system, see the [downloads page](https://synthesiswork.org/download/).
 

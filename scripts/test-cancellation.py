@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """Bounded cancellation checks; all workers are local disposable processes."""
-import hashlib
 import importlib.util
-import io
-import json
 import os
 from pathlib import Path
 import shlex
 import signal
 import subprocess
 import sys
-import tarfile
-import tempfile
 import time
 import unittest
 
@@ -54,73 +49,29 @@ class Cancellation(unittest.TestCase):
             process.wait(timeout=5)
             process.stderr.close()
 
-    def test_bridge_forwards_incoming_cancellation(self):
-        for method,args in [('runSetup',[]),('runSynthesis',['doctor'])]:
-            for sig in [signal.SIGINT,signal.SIGTERM,signal.SIGHUP]:
-                with self.subTest(method=method,signal=sig),tempfile.TemporaryDirectory(prefix='ownwords-cancel-') as temp:
-                    root=Path(temp);bundle=root/'bundle';(bundle/'bin').mkdir(parents=True);(bundle/'lib').mkdir()
-                    launcher=bundle/'bin/synthesis';launcher.write_text(self.worker(root));launcher.chmod(0o755)
-                    (bundle/'lib/release.json').write_text(json.dumps({'schema_version':1,'version':'9.8.7','commit':'a'*40}))
-                    files={}
-                    for name in ['bin/synthesis','lib/release.json']:
-                        p=bundle/name;files[name]={'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'mode':p.stat().st_mode&0o777}
-                    (bundle/'bundle-integrity.json').write_text(json.dumps({'schema_version':1,'version':'9.8.7','commit':'a'*40,'archive_sha256':'b'*64,'files':files}))
-                    js='const m=require('+json.dumps(str(ROOT/'lib/setup.js'))+');Promise.resolve(m['+json.dumps(method)+']('+json.dumps(args)+',{bundleRoot:'+json.dumps(str(bundle))+'})).then(code=>process.exit(code));'
-                    self.assert_cancel(['node','-e',js],dict(os.environ),root,sig)
-
-    def curl_case(self,phase,sig):
-        case=curl_fixture.CurlInstaller();case.setUp()
-        try:
-            if phase=='transport':
-                (case.root/'transport/curl').write_text(self.worker(case.root))
-            else:
-                code=b'const fs=require("fs"); for(const [s,n] of [["SIGINT",2],["SIGTERM",15],["SIGHUP",1]])process.on(s,()=>{fs.writeFileSync(process.env.OWNWORDS_STOPPED,String(n));process.exit(0)});fs.writeFileSync(process.env.OWNWORDS_READY,String(process.pid));setTimeout(()=>{},30000);\n'
-                with tarfile.open(case.archive,'w:gz') as tar:
-                    for name,data,mode in [('package/bin/ownwords.js',code,0o755),('package/package.json',b'{"version":"9.8.7"}',0o644),('package/vendor/synthesis/bin/synthesis',b'fixture\n',0o755)]:
-                        info=tarfile.TarInfo(name);info.size=len(data);info.mode=mode;tar.addfile(info,io.BytesIO(data))
-                case.installer.write_text((ROOT/'packages/install.sh').read_text().replace('@VERSION@','9.8.7').replace('@ARCHIVE_SHA256@',hashlib.sha256(case.archive.read_bytes()).hexdigest()))
-            self.assert_cancel(['sh',str(case.installer),'--prefix',str(case.prefix),'--no-dormant-core'],case.env,case.root,sig)
-            self.assertFalse(list(case.prefix.glob('.ownwords-download-*')))
-            if phase=='transport':self.assertFalse((case.prefix/'ownwords').exists())
-            else:self.assertTrue((case.prefix/'.ownwords-install.json').exists())
-        finally:case.tearDown()
-
     def test_curl_forwards_transport_cancellation(self):
         for sig in [signal.SIGINT,signal.SIGTERM,signal.SIGHUP]:
-            with self.subTest(signal=sig):self.curl_case('transport',sig)
+            with self.subTest(signal=sig):
+                case=curl_fixture.CurlInstaller();case.setUp()
+                try:
+                    (case.root/'transport/curl').write_text(self.worker(case.root))
+                    self.assert_cancel(['sh',str(case.installer),'--prefix',str(case.prefix)],case.env,case.root,sig)
+                    self.assertFalse(list(case.prefix.glob('.ownwords-download-*')))
+                    self.assertFalse((case.prefix/'ownwords').exists())
+                    self.assertFalse((case.prefix/'.ownwords-install.json').exists())
+                finally:case.tearDown()
 
-    def test_curl_forwards_setup_cancellation(self):
-        for sig in [signal.SIGINT,signal.SIGTERM,signal.SIGHUP]:
-            with self.subTest(signal=sig):self.curl_case('setup',sig)
-
-    def test_curl_propagates_transport_exit(self):
-        case=curl_fixture.CurlInstaller();case.setUp()
-        try:
-            (case.root/'transport/curl').write_text('#!/bin/sh\nexit 23\n')
-            self.assertEqual(case.run_installer().returncode,23)
-            self.assertFalse((case.prefix/'ownwords').exists())
-            self.assertFalse(list(case.prefix.glob('.ownwords-download-*')))
-        finally:case.tearDown()
-
-
-    def test_curl_propagates_child_failure_and_signal(self):
-        for phase in ('transport','setup'):
-            for expected in (23,-signal.SIGTERM):
-                with self.subTest(phase=phase,exit=expected):
-                    case=curl_fixture.CurlInstaller();case.setUp()
-                    try:
-                        if phase=='transport':
-                            (case.root/'transport/curl').write_text('#!/bin/sh\n'+('exit 23' if expected==23 else 'kill -TERM $$')+'\n')
-                        else:
-                            code=b'process.exit(23);\n' if expected==23 else b'process.kill(process.pid,"SIGTERM");\n'
-                            with tarfile.open(case.archive,'w:gz') as tar:
-                                for name,data,mode in [('package/bin/ownwords.js',code,0o755),('package/package.json',b'{"version":"9.8.7"}',0o644),('package/vendor/synthesis/bin/synthesis',b'fixture\n',0o755)]:
-                                    info=tarfile.TarInfo(name);info.size=len(data);info.mode=mode;tar.addfile(info,io.BytesIO(data))
-                            case.installer.write_text((ROOT/'packages/install.sh').read_text().replace('@VERSION@','9.8.7').replace('@ARCHIVE_SHA256@',hashlib.sha256(case.archive.read_bytes()).hexdigest()))
-                        self.assertEqual(case.run_installer().returncode,expected)
-                        self.assertFalse(list(case.prefix.glob('.ownwords-download-*')))
-                        self.assertEqual((case.prefix/'.ownwords-install.json').exists(),phase=='setup')
-                    finally:case.tearDown()
+    def test_curl_propagates_transport_failure_and_signal(self):
+        for expected in (23,-signal.SIGTERM):
+            with self.subTest(exit=expected):
+                case=curl_fixture.CurlInstaller();case.setUp()
+                try:
+                    (case.root/'transport/curl').write_text('#!/bin/sh\n'+('exit 23' if expected==23 else 'kill -TERM $$')+'\n')
+                    self.assertEqual(case.run_installer().returncode,expected)
+                    self.assertFalse(list(case.prefix.glob('.ownwords-download-*')))
+                    self.assertFalse((case.prefix/'ownwords').exists())
+                    self.assertFalse((case.prefix/'.ownwords-install.json').exists())
+                finally:case.tearDown()
 
 
 if __name__=='__main__':unittest.main()

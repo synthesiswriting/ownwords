@@ -146,6 +146,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.0.0] - Unreleased
+
+Ownwords installs and runs as a standalone tool. Version 1.6.0 bundled the core package of the 4.x synthesis work system and added commands to stage and manage it; this release removes that package and those commands from the tool and from every distribution channel. For the current synthesis work system, see the [downloads page](https://synthesiswork.org/download/).
+
+### Removed
+
+- **`ownwords setup`** and its `--no-dormant-core` and `--json` options.
+- **`ownwords synthesis`** with its `activate`, `deactivate`, `status`, `doctor`, `repair` and `update` subcommands. Running either removed command now reports an unknown command.
+- **The bundled core.** Release archives no longer carry `vendor/synthesis`, and `lib/setup.js`, which verified and launched it, is gone.
+- **The curl installer's setup step and its `--no-dormant-core` option.** The installer verifies and installs Ownwords, then runs nothing it installed.
+- **Core inputs to the release build.** `scripts/build-distribution.py` no longer takes `--core-archive` or `--core-sha256`, the Verified distribution workflow no longer takes `core_archive_url` or `core_archive_sha256`, and `distribution.json` no longer has a `core` field.
+- **Git, Python 3.12 and `SYNTHESIS_BOOTSTRAP_PYTHON` from the Homebrew formula,** which now declares only Node.
+
+### Changed
+
+- The curl installer no longer needs Git or Python 3.12–3.14, which only the setup step used. It needs Python 3.9 or later and curl, and Ownwords needs Node.js 18 or later.
+- The Homebrew formula's test converts a short HTML file to Markdown instead of looking for `setup` in the help text.
+- The README's curl command fetches the installer from the latest release instead of a fixed version, and its dependency list names the npm packages and commands Ownwords uses.
+
+---
+
 ## [Unreleased]
 
 ### Planned

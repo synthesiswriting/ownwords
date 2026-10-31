@@ -5,7 +5,6 @@ import gzip
 import io
 import hashlib
 import json
-import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -24,51 +23,6 @@ def sha(path):
 def regular(path):
     if path.is_symlink() or not path.is_file():
         raise ValueError('artifact input must be a regular file: %s' % path)
-
-
-def vendor_core(archive, expected, destination):
-    regular(archive)
-    if not re.fullmatch(r'[a-f0-9]{64}', expected) or sha(archive) != expected:
-        raise ValueError('core archive checksum mismatch')
-    destination.mkdir(parents=True, exist_ok=False)
-    with tarfile.open(archive, 'r:gz') as bundle:
-        members = bundle.getmembers()
-        seen = set()
-        for member in members:
-            name = PurePosixPath(member.name)
-            if name.is_absolute() or '..' in name.parts or not name.parts or name.parts[0] not in {'synthesis', 'package'} or not (member.isfile() or member.isdir()):
-                raise ValueError('core archive contains an unsafe member')
-            relative = PurePosixPath(*name.parts[1:])
-            if str(relative) == '.':
-                if not member.isdir():
-                    raise ValueError('core archive root is not a directory')
-                continue
-            if relative in seen:
-                raise ValueError('core archive contains a duplicate member')
-            seen.add(relative)
-            target = destination / str(relative)
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-            else:
-                if member.mode & 0o7000:
-                    raise ValueError('core archive has a privileged mode')
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with bundle.extractfile(member) as source, target.open('xb') as output:
-                    shutil.copyfileobj(source, output)
-                target.chmod(0o755 if member.mode & 0o111 else 0o644)
-    release = json.loads((destination / 'lib/release.json').read_text())
-    if release.get('schema_version') != 1 or not re.fullmatch(r'\d+\.\d+\.\d+', str(release.get('version'))) or not re.fullmatch(r'[a-f0-9]{40}', str(release.get('commit'))):
-        raise ValueError('core release identity is invalid')
-    if sha(destination / 'lib/onboard.sh') != release.get('bootstrap_sha256'):
-        raise ValueError('core bootstrap checksum mismatch')
-    required = {'bin/synthesis', 'lib/package_launcher.py', 'lib/release_runtime.py', 'lib/onboard.sh', 'lib/release.json', 'LICENSE', 'README.md', 'package.json'}
-    files = {p.relative_to(destination).as_posix(): {'sha256': sha(p), 'mode': p.stat().st_mode & 0o777}
-             for p in sorted(destination.rglob('*')) if p.is_file()}
-    if set(files) != required:
-        raise ValueError('core thin package inventory changed; review its new contract before packaging')
-    manifest = {'schema_version': 1, 'version': release['version'], 'commit': release['commit'], 'archive_sha256': expected, 'files': files}
-    (destination / 'bundle-integrity.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
-    return manifest
 
 
 def archive_tree(source, destination):
@@ -137,17 +91,16 @@ def render_formula(version, checksum, revision=0):
   sha256 "%s"
 %s  license "MIT"
   depends_on "node"
-  depends_on "git"
-  depends_on "python@3.12"
   def install
     libexec.install Dir["*"]
     (bin/"ownwords").write_env_script libexec/"bin/ownwords.js",
-      PATH: "#{Formula["node"].opt_bin}:#{Formula["git"].opt_bin}:$PATH",
-      SYNTHESIS_BOOTSTRAP_PYTHON: "#{Formula["python@3.12"].opt_bin}/python3.12"
+      PATH: "#{Formula["node"].opt_bin}:$PATH"
   end
   test do
     assert_match "ownwords v%s", shell_output("#{bin}/ownwords --version")
-    assert_match "setup", shell_output("#{bin}/ownwords --help")
+    (testpath/"article.html").write "<html><body><article><h1>Fixture article</h1><p>Retained author words.</p></article></body></html>"
+    system bin/"ownwords", "convert", "article.html", "article.md"
+    assert_match "Retained author words", (testpath/"article.md").read
   end
 end
 ''' % (url, checksum, ('  revision %d\n' % revision) if revision else '', version)
@@ -203,7 +156,7 @@ def formula_from_published(distribution, archive, output, revision=0):
     return result
 
 
-def build(source, output, core_archive, core_sha256, npm_cache=None, source_identity=None, formula_revision=0):
+def build(source, output, npm_cache=None, source_identity=None, formula_revision=0):
     if type(formula_revision) is not int or formula_revision < 0:
         raise ValueError('formula revision must be a non-negative integer')
     source = source.resolve()
@@ -232,7 +185,6 @@ def build(source, output, core_archive, core_sha256, npm_cache=None, source_iden
     for name in ('package.json', 'package-lock.json', 'README.md', 'LICENSE'):
         regular(source / name)
         shutil.copyfile(source / name, package / name)
-    core = vendor_core(core_archive, core_sha256, package / 'vendor/synthesis')
     metadata = json.loads((package / 'package.json').read_text())
     version = metadata['version']
     if not re.fullmatch(r'\d+\.\d+\.\d+', version):
@@ -247,7 +199,7 @@ def build(source, output, core_archive, core_sha256, npm_cache=None, source_iden
     subprocess.run(command, cwd=package, check=True)
     metadata['dependencies'] = {name: json.loads((package / 'node_modules' / name / 'package.json').read_text())['version'] for name in metadata.get('dependencies', {})}
     metadata['bundleDependencies'] = sorted(metadata.get('dependencies', {}))
-    metadata['files'] = sorted(set(metadata['files']) | {'vendor/', 'docs/', 'package-lock.json'})
+    metadata['files'] = sorted(set(metadata['files']) | {'docs/', 'package-lock.json'})
     (package / 'package.json').write_text(json.dumps(metadata, indent=2) + '\n')
     artifact = output / ('ownwords-' + version + '.tgz')
     archive_tree(package, artifact)
@@ -264,7 +216,6 @@ def build(source, output, core_archive, core_sha256, npm_cache=None, source_iden
     (output / 'ownwords.rb').write_text(formula)
     result = {'schema_version': 1, 'version': version, 'archive': artifact.name, 'sha256': checksum,
               'formula_revision': formula_revision, 'url': url, 'npm_package': 'ownwords', 'brew_formula': 'synthesisengineering/tap/ownwords',
-              'core': {key: core[key] for key in ('version', 'commit', 'archive_sha256')},
               'source': source_identity or {'kind':'fixture'},
               'channels': ['curl', 'npm', 'bun', 'homebrew', 'direct'], 'aur': 'not-published',
               'installer': {'file': 'install.sh', 'url': SOURCE + '/releases/download/v' + version + '/install.sh', 'sha256': installer_checksum}}
@@ -276,20 +227,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo-root', type=Path, default=ROOT)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--core-archive', type=Path)
-    parser.add_argument('--core-sha256')
     parser.add_argument('--formula-revision', type=int, default=0, help='Homebrew recipe revision; new payload releases default to 0')
     parser.add_argument('--formula-from-distribution', type=Path, help='Generate only a formula for this existing published distribution metadata')
     parser.add_argument('--published-archive', type=Path, help='Exact unchanged payload required by formula-only generation')
     parser.add_argument('--npm-cache', type=Path)
     args = parser.parse_args()
     if args.formula_from_distribution:
-        if not args.published_archive or args.core_archive or args.core_sha256 or args.npm_cache:
-            parser.error('formula-only requires --published-archive and cannot rebuild core or npm payloads')
+        if not args.published_archive or args.npm_cache:
+            parser.error('formula-only requires --published-archive and cannot rebuild npm payloads')
         print(json.dumps(formula_from_published(args.formula_from_distribution, args.published_archive, args.output, args.formula_revision), indent=2))
         return
-    if args.published_archive or not args.core_archive or not args.core_sha256:
-        parser.error('full build requires --core-archive and --core-sha256')
+    if args.published_archive:
+        parser.error('--published-archive applies only to --formula-from-distribution')
     source = args.repo_root.resolve()
     output=args.output.absolute()
     if output==source or source in output.parents or output in source.parents:
@@ -297,7 +246,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='ownwords-release-') as temporary:
         snapshot=Path(temporary)/'source'
         identity=materialize_release(source,snapshot)
-        print(json.dumps(build(snapshot,args.output,args.core_archive,args.core_sha256,args.npm_cache,identity,args.formula_revision),indent=2))
+        print(json.dumps(build(snapshot,args.output,args.npm_cache,identity,args.formula_revision),indent=2))
 
 
 if __name__ == '__main__':

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Offline safety and determinism fixtures for the distribution builder."""
-import hashlib
 import importlib.util
 import io
 import json
@@ -8,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 import tarfile
 import tempfile
@@ -27,35 +27,33 @@ class Packaging(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def archive(self,names):
-        target=self.root/'core.tar.gz'
-        with tarfile.open(target,'w:gz') as tar:
-            for name in names:
-                item=tarfile.TarInfo(name);item.size=4
-                tar.addfile(item,io.BytesIO(b'test'))
-        return target
-
-    def test_checksum_failure_writes_nothing(self):
-        source=self.archive(['synthesis/file'])
-        with self.assertRaisesRegex(ValueError,'checksum'):
-            builder.vendor_core(source,'0'*64,self.root/'vendor')
-        self.assertFalse((self.root/'vendor').exists())
-
-    def test_archive_traversal_and_duplicates_are_rejected(self):
-        for names in (['synthesis/../../escaped'],['synthesis/file','synthesis/file']):
-            source=self.archive(names)
-            with self.assertRaisesRegex(ValueError,'unsafe|duplicate'):
-                builder.vendor_core(source,hashlib.sha256(source.read_bytes()).hexdigest(),self.root/str(len(names)))
-        self.assertFalse((self.root.parent/'escaped').exists())
+    def build_fixture(self):
+        """Build a dependency-free fixture through the real builder and the real installer template."""
+        source=self.root/'source';source.mkdir()
+        for directory in ('bin','lib','types','docs','packages'):
+            (source/directory).mkdir()
+        metadata={'name':'ownwords','version':'9.8.7','dependencies':{},'files':['bin/','lib/']}
+        (source/'package.json').write_text(json.dumps(metadata))
+        (source/'package-lock.json').write_text(json.dumps({'name':'ownwords','version':'9.8.7','lockfileVersion':3,'packages':{'':metadata}}))
+        for name in ('README.md','LICENSE','bin/ownwords.js','lib/index.js','types/index.d.ts','docs/distribution.md'):
+            (source/name).write_text('fixture only\n')
+        shutil.copyfile(builder.ROOT/'packages/install.sh',source/'packages/install.sh')
+        output=self.root/'output'
+        # This fixture has no dependencies. The full distribution consumer
+        # suite separately exercises real locked npm acquisition.
+        with mock.patch.object(builder.subprocess,'run',return_value=subprocess.CompletedProcess([],0)) as npm:
+            result=builder.build(source,output)
+        npm.assert_called_once()
+        return output,result
 
     def test_source_tree_cannot_be_an_output(self):
         source=self.root/'source';source.mkdir()
         with self.assertRaisesRegex(ValueError,'outside'):
-            builder.build(source,source/'lib/release',self.root/'absent','0'*64)
+            builder.build(source,source/'lib/release')
         self.assertFalse((source/'lib').exists())
         adjacent=self.root/'adjacent';adjacent.mkdir()
         with self.assertRaisesRegex(ValueError,'traversal|outside'):
-            builder.build(source,adjacent/'..'/'source'/'generated',self.root/'absent','0'*64)
+            builder.build(source,adjacent/'..'/'source'/'generated')
         self.assertFalse((source/'generated').exists())
 
     def test_archive_is_deterministic_and_rejects_foreign_symlink(self):
@@ -99,42 +97,53 @@ class Packaging(unittest.TestCase):
         self.assertLess(text.index('npm@11.15.0'),text.index('npm publish '))
         self.assertNotIn('NODE_AUTH_TOKEN:',text)
 
-    def test_homebrew_formula_declares_and_pins_explicit_setup_prerequisites(self):
-        source=self.root/'source';source.mkdir()
-        for directory in ('bin','lib','types','docs','packages'):
-            (source/directory).mkdir()
-        metadata={'name':'ownwords','version':'9.8.7','dependencies':{},'files':['bin/','lib/']}
-        (source/'package.json').write_text(json.dumps(metadata))
-        (source/'package-lock.json').write_text(json.dumps({'name':'ownwords','version':'9.8.7','lockfileVersion':3,'packages':{'':metadata}}))
-        for name in ('README.md','LICENSE','bin/ownwords.js','lib/index.js','types/index.d.ts','docs/distribution.md'):
-            (source/name).write_text('fixture only\n')
-        (source/'packages/install.sh').write_text('#!/bin/sh\n# @VERSION@ @ARCHIVE_SHA256@\n')
-        bootstrap=b'#!/bin/sh\nexit 0\n'
-        release={'schema_version':1,'version':'9.8.7','commit':'1'*40,'bootstrap_sha256':hashlib.sha256(bootstrap).hexdigest()}
-        files={'bin/synthesis':bootstrap,'lib/onboard.sh':bootstrap,'lib/package_launcher.py':b'# fixture\n',
-               'lib/release_runtime.py':b'# fixture\n','lib/release.json':json.dumps(release).encode(),
-               'LICENSE':b'fixture\n','README.md':b'fixture\n','package.json':b'{}\n'}
-        core=self.root/'core.tgz'
-        with tarfile.open(core,'w:gz') as archive:
-            for name,data in files.items():
-                member=tarfile.TarInfo('synthesis/'+name);member.size=len(data)
-                member.mode=0o755 if name=='bin/synthesis' else 0o644
-                archive.addfile(member,io.BytesIO(data))
-        output=self.root/'output'
-        # This renderer fixture has no dependencies. The full distribution
-        # consumer suite separately exercises real locked npm acquisition.
-        with mock.patch.object(builder.subprocess,'run',return_value=subprocess.CompletedProcess([],0)) as npm:
-            builder.build(source,output,core,hashlib.sha256(core.read_bytes()).hexdigest())
-        npm.assert_called_once()
+    def test_release_inputs_carry_no_core(self):
+        workflow=(builder.ROOT/'.github/workflows/distribution.yml').read_text()
+        for retired in ('core_archive','--core-','synthesis-skills'):
+            self.assertNotIn(retired,workflow)
+        output=self.root/'refused'
+        refused=subprocess.run([sys.executable,'-B',builder.__file__,'--output',str(output),'--core-archive',str(self.root/'core.tgz'),'--core-sha256','0'*64],capture_output=True,text=True,timeout=60)
+        self.assertEqual(refused.returncode,2,refused.stdout+refused.stderr)
+        self.assertIn('unrecognized arguments: --core-archive',refused.stderr)
+        self.assertFalse(output.exists())
+
+    def test_build_packages_ownwords_alone(self):
+        output,result=self.build_fixture()
+        archive=output/'ownwords-9.8.7.tgz'
+        with tarfile.open(archive) as tar:
+            names=sorted(tar.getnames())
+        # The exact inventory proves nothing beyond the Ownwords source is injected: no vendor tree, no core launcher.
+        self.assertEqual(names,['package/LICENSE','package/README.md','package/bin','package/bin/ownwords.js','package/docs',
+                                'package/docs/distribution.md','package/lib','package/lib/index.js','package/package-lock.json',
+                                'package/package.json','package/types','package/types/index.d.ts'])
+        manifest=json.loads((output/'package/package.json').read_text())
+        self.assertEqual(manifest['files'],['bin/','docs/','lib/','package-lock.json'])
+        self.assertEqual(manifest['dependencies'],{})
+        self.assertEqual(manifest['bundleDependencies'],[])
+        self.assertEqual(sorted(result),['archive','aur','brew_formula','channels','formula_revision','installer','npm_package',
+                                         'schema_version','sha256','source','url','version'])
+        self.assertEqual(result['channels'],['curl','npm','bun','homebrew','direct'])
+        self.assertEqual(json.loads((output/'distribution.json').read_text()),result)
+        self.assertEqual(sorted(p.name for p in output.iterdir()),['SHA256SUMS','distribution.json','install.sh','ownwords-9.8.7.tgz','ownwords.rb','package'])
+        installer=(output/'install.sh').read_text()
+        self.assertEqual(builder.sha(output/'install.sh'),result['installer']['sha256'])
+        self.assertIn("VERSION='9.8.7'\n",installer)
+        self.assertIn("ARCHIVE_SHA256='"+result['sha256']+"'\n",installer)
+        self.assertEqual((output/'SHA256SUMS').read_text(),result['sha256']+'  ownwords-9.8.7.tgz\n'+result['installer']['sha256']+'  install.sh\n')
+        for retired in ('@VERSION@','@ARCHIVE_SHA256@','setup','dormant','vendor/'):
+            self.assertNotIn(retired,installer)
+
+    def test_homebrew_formula_declares_only_node(self):
+        output,result=self.build_fixture()
         formula=(output/'ownwords.rb').read_text()
-        self.assertIn('depends_on "node"',formula)
-        self.assertIn('depends_on "git"',formula)
-        self.assertIn('depends_on "python@3.12"',formula)
-        self.assertIn('PATH: "#{Formula["node"].opt_bin}:#{Formula["git"].opt_bin}:$PATH"',formula)
-        self.assertIn('SYNTHESIS_BOOTSTRAP_PYTHON: "#{Formula["python@3.12"].opt_bin}/python3.12"',formula)
-        self.assertEqual(json.loads((output/'package/package.json').read_text())['dependencies'],{})
-
-
+        self.assertEqual(re.findall(r'^  depends_on .+$',formula,re.M),['  depends_on "node"'])
+        self.assertIn('    (bin/"ownwords").write_env_script libexec/"bin/ownwords.js",\n      PATH: "#{Formula["node"].opt_bin}:$PATH"\n  end\n',formula)
+        self.assertIn('  sha256 "'+result['sha256']+'"\n',formula)
+        self.assertIn('assert_match "ownwords v9.8.7", shell_output("#{bin}/ownwords --version")',formula)
+        self.assertIn('system bin/"ownwords", "convert", "article.html", "article.md"',formula)
+        self.assertIn('assert_match "Retained author words", (testpath/"article.md").read',formula)
+        for retired in ('Formula["git"]','python','SYNTHESIS','setup'):
+            self.assertNotIn(retired,formula)
 
     def test_formula_only_validates_published_archive_without_rebuilding_it(self):
         archive=self.root/'ownwords-1.6.1.tgz'
@@ -198,27 +207,27 @@ class Packaging(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'revision'):
                 builder.render_formula(version,checksum,revision=invalid)
 
-    def test_actual_homebrew_writer_keeps_runtime_path_and_dependency_git(self):
+    def test_actual_homebrew_writer_resolves_commands_through_runtime_path(self):
         brew=shutil.which('brew')
         if not brew:
             self.skipTest('actual Homebrew writer requires Homebrew; portable formula checks still run')
-        node=shutil.which('node'); git=shutil.which('git')
-        self.assertTrue(node and git)
-        # Use the generated formula from the existing physical renderer fixture.
-        self.test_homebrew_formula_declares_and_pins_explicit_setup_prerequisites()
-        formula=(self.root/'output/ownwords.rb').read_text()
-        expression=re.search(r'^      PATH: (.+),$',formula,re.M).group(1)
-        for part in ('node/bin','git/bin','build-shims','runtime-bin'):
+        node=shutil.which('node'); curl=shutil.which('curl')
+        self.assertTrue(node and curl)
+        output,_=self.build_fixture()
+        formula=(output/'ownwords.rb').read_text()
+        expression=re.search(r'^      PATH: (.+)$',formula,re.M).group(1)
+        for part in ('node/bin','build-shims','runtime-bin'):
             (self.root/part).mkdir(parents=True)
         (self.root/'node/bin/node').symlink_to(node)
-        (self.root/'git/bin/git').symlink_to(git)
+        # Ownwords shells out to curl for HTML fetches; a build-time shim must never shadow the runtime one.
         marker=self.root/'build-shim-ran'
-        (self.root/'build-shims/git').write_text('#!/bin/sh\nprintf bad > "'+str(marker)+'"\nexit 97\n')
-        (self.root/'build-shims/git').chmod(0o755)
+        (self.root/'build-shims/curl').write_text('#!/bin/sh\nprintf bad > "'+str(marker)+'"\nexit 97\n')
+        (self.root/'build-shims/curl').chmod(0o755)
+        (self.root/'runtime-bin/curl').symlink_to(curl)
         (self.root/'runtime-bin/runtime-marker').write_text('#!/bin/sh\nprintf runtime-ok\n')
         (self.root/'runtime-bin/runtime-marker').chmod(0o755)
         target=self.root/'probe.js'
-        target.write_text('#!/usr/bin/env node\nconst {spawnSync}=require("node:child_process"); for(const [c,a] of [["git",["--version"]],["runtime-marker",[]]]){const r=spawnSync(c,a,{encoding:"utf8"}); if(r.status!==0)process.exit(r.status||98);console.log(r.stdout.trim());}\n')
+        target.write_text('#!/usr/bin/env node\nconst {spawnSync}=require("node:child_process"); for(const [c,a] of [["curl",["--version"]],["runtime-marker",[]]]){const r=spawnSync(c,a,{encoding:"utf8"}); if(r.status!==0)process.exit(r.status||98);console.log(r.stdout.trim());}\n')
         target.chmod(0o755)
         wrapper=self.root/'wrapper'
         ruby='require "pathname"; class Formula; def self.[](name); Struct.new(:opt_bin).new(Pathname.new(ARGV[0])/name/"bin"); end; end; ENV["PATH"]=ARGV[0]+"/build-shims:/usr/bin:/bin"; value=eval(ARGV[1]); Pathname.new(ARGV[2]).write_env_script(ARGV[3], PATH: value)'
@@ -227,12 +236,12 @@ class Packaging(unittest.TestCase):
         wrapper.chmod(0o755)
         ran=subprocess.run([str(wrapper)],env={'PATH':str(self.root/'runtime-bin')+':/usr/bin:/bin','HOME':str(self.root)},capture_output=True,text=True)
         self.assertEqual(ran.returncode,0,ran.stdout+ran.stderr)
-        self.assertIn('git version',ran.stdout)
+        self.assertTrue(ran.stdout.startswith('curl '),ran.stdout)
         self.assertIn('runtime-ok',ran.stdout)
         self.assertFalse(marker.exists())
         self.assertNotIn('build-shims',wrapper.read_text())
-        # Positive failure control: the prior formula captures the poisoned
-        # build PATH through the same real Homebrew writer and exits at Git.
+        # Positive failure control: a recipe that captures the build PATH
+        # through the same real Homebrew writer resolves the poisoned shim.
         prior='"#{Formula["node"].opt_bin}:#{ENV["PATH"]}"'
         bad_wrapper=self.root/'prior-wrapper'
         written=subprocess.run([brew,'ruby','-e',ruby,str(self.root),prior,str(bad_wrapper),str(target)],capture_output=True,text=True)
@@ -241,7 +250,6 @@ class Packaging(unittest.TestCase):
         refused=subprocess.run([str(bad_wrapper)],env={'PATH':str(self.root/'runtime-bin')+':/usr/bin:/bin','HOME':str(self.root)},capture_output=True,text=True)
         self.assertEqual(refused.returncode,97,refused.stdout+refused.stderr)
         self.assertEqual(marker.read_text(),'bad')
-
 
 if __name__=='__main__':
     unittest.main()

@@ -90,7 +90,6 @@ def main():
     if sys.version_info<(3,9):raise ValueError('Python 3.9 or later is required for installation.')
     parser=argparse.ArgumentParser(description='Install checksum-bound Ownwords; preserve unknown or edited files.')
     parser.add_argument('--prefix',default=os.environ.get('OWNWORDS_INSTALL_DIR',str(Path.home()/'.local/bin')))
-    parser.add_argument('--no-dormant-core',action='store_true')
     args=parser.parse_args()
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+',VERSION) or not re.fullmatch(r'[a-f0-9]{64}',ARCHIVE_SHA256):raise ValueError('Use the built release installer, not maintainer template source.')
     node=shutil.which('node')
@@ -129,7 +128,7 @@ def main():
                     if relative in seen or relative=='.':raise ValueError('Release contains a duplicate or empty member.')
                     seen.add(relative)
                     if member.isfile():files[relative]=(archive.extractfile(member).read(),0o755 if member.mode&0o111 else 0o644)
-            if not {'bin/ownwords.js','package.json','vendor/synthesis/bin/synthesis'}<=set(files):raise ValueError('Release is missing executable components.')
+            if not {'bin/ownwords.js','package.json'}<=set(files):raise ValueError('Release is missing executable components.')
             if json.loads(files['package.json'][0])['version']!=VERSION:raise ValueError('Release package version differs from the installer.')
             expected={name:(hashlib.sha256(data).hexdigest(),mode) for name,(data,mode) in files.items()}
             directory(release)
@@ -155,11 +154,7 @@ def main():
             encoded=(json.dumps(record,sort_keys=True)+'\n').encode()
             atomic(journal,encoded);atomic(target,body,0o755);atomic(receipt,encoded);journal.unlink()
         finally:download.unlink(missing_ok=True)
-    try:run_child([str(target),'setup']+(['--no-dormant-core'] if args.no_dormant_core else []))
-    except ChildFailure:
-        print('Ownwords is installed, but explicit optional setup failed; retry after resolving the reported cause.',file=sys.stderr)
-        raise
-    print('Installed Ownwords %s; optional setup completed without activating agent hooks or services.'%VERSION)
+    print('Installed Ownwords %s at %s.'%(VERSION,target))
     if str(prefix) not in os.environ.get('PATH','').split(os.pathsep):print('Add %s to PATH to use ownwords.'%prefix)
 
 

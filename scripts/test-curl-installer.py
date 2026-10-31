@@ -11,6 +11,8 @@ import tempfile
 import unittest
 
 ROOT=Path(__file__).resolve().parent.parent
+# The fixture launcher records every invocation, so a test can prove the installer never runs it.
+LAUNCHER=b'require("fs").appendFileSync(process.env.OWNWORDS_FIXTURE_INVOCATIONS,JSON.stringify(process.argv.slice(2))+"\\n");console.log("ownwords v9.8.7");\n'
 
 
 class CurlInstaller(unittest.TestCase):
@@ -20,23 +22,28 @@ class CurlInstaller(unittest.TestCase):
         self.home=self.root/'home'; self.home.mkdir()
         self.prefix=self.root/'prefix'
         self.archive=self.root/'ownwords.tgz'
-        script=b'if(process.argv[2]==="setup") console.log("fixture setup: "+process.argv.slice(3).join(" ")); else console.log("ownwords v9.8.7");\n'
+        self.invocations=self.root/'launcher-invocations'
         with tarfile.open(self.archive,'w:gz') as tar:
-            for name,data,mode in [('package/bin/ownwords.js',script,0o755),('package/package.json',b'{"version":"9.8.7"}',0o644),('package/vendor/synthesis/bin/synthesis',b'fixture\n',0o755)]:
+            for name,data,mode in [('package/bin/ownwords.js',LAUNCHER,0o755),('package/package.json',b'{"version":"9.8.7"}',0o644)]:
                 info=tarfile.TarInfo(name);info.size=len(data);info.mode=mode
                 tar.addfile(info,io.BytesIO(data))
         self.installer=self.root/'install.sh'
-        self.installer.write_text((ROOT/'packages/install.sh').read_text().replace('@VERSION@','9.8.7').replace('@ARCHIVE_SHA256@',hashlib.sha256(self.archive.read_bytes()).hexdigest()))
+        self.bind_installer()
         traps=self.root/'transport';traps.mkdir()
         curl=traps/'curl';curl.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$OWNWORDS_CURL_ARGS"\nwhile [ "$1" != "-o" ]; do shift; done\ncp "$OWNWORDS_CURL_ARCHIVE" "$2"\n');curl.chmod(0o755)
-        self.env={k:v for k,v in os.environ.items() if not k.startswith(('SYNTHESIS_','XDG_','GIT_'))}
-        self.env.update(HOME=str(self.home),PATH=str(traps)+os.pathsep+self.env['PATH'],OWNWORDS_CURL_ARCHIVE=str(self.archive),OWNWORDS_CURL_ARGS=str(self.root/'curl.args'))
+        self.env={k:v for k,v in os.environ.items() if not k.startswith(('XDG_','GIT_'))}
+        self.env.update(HOME=str(self.home),PATH=str(traps)+os.pathsep+self.env['PATH'],OWNWORDS_CURL_ARCHIVE=str(self.archive),
+                        OWNWORDS_CURL_ARGS=str(self.root/'curl.args'),OWNWORDS_FIXTURE_INVOCATIONS=str(self.invocations))
 
     def tearDown(self):
         self.temporary.cleanup()
 
-    def run_installer(self):
-        return subprocess.run(['sh',str(self.installer),'--prefix',str(self.prefix),'--no-dormant-core'],env=self.env,text=True,capture_output=True,timeout=30)
+    def bind_installer(self):
+        """Write the maintainer template bound to the current fixture archive, as the release build does."""
+        self.installer.write_text((ROOT/'packages/install.sh').read_text().replace('@VERSION@','9.8.7').replace('@ARCHIVE_SHA256@',hashlib.sha256(self.archive.read_bytes()).hexdigest()))
+
+    def run_installer(self,*extra):
+        return subprocess.run(['sh',str(self.installer),'--prefix',str(self.prefix),*extra],env=self.env,text=True,capture_output=True,timeout=30)
 
     def test_installs_repeats_and_recovers_bound_journal(self):
         first=self.run_installer();self.assertEqual(first.returncode,0,first.stdout+first.stderr)
@@ -44,7 +51,7 @@ class CurlInstaller(unittest.TestCase):
         self.assertIn('https://github.com/synthesiswriting/ownwords/releases/download/v9.8.7/ownwords-9.8.7.tgz',args)
         self.assertIn('--proto-redir',args)
         binary=self.prefix/'ownwords'; receipt=self.prefix/'.ownwords-install.json'; pending=self.prefix/'.ownwords-install.pending.json'
-        self.assertIn('fixture setup: --no-dormant-core',first.stdout)
+        self.assertIn('Installed Ownwords 9.8.7 at '+str(binary),first.stdout)
         before=binary.read_bytes()
         self.assertEqual(self.run_installer().returncode,0)
         pending.write_bytes(receipt.read_bytes()); receipt.unlink()
@@ -54,6 +61,26 @@ class CurlInstaller(unittest.TestCase):
         self.assertEqual(self.run_installer().returncode,0)
         self.assertEqual(binary.read_bytes(),before);self.assertFalse(pending.exists())
         self.assertEqual(list(self.home.iterdir()),[])
+
+    def test_installs_ownwords_only_and_runs_nothing_it_installed(self):
+        result=self.run_installer();self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertFalse(self.invocations.exists(),'the installer ran the launcher it installed: '+(self.invocations.read_text() if self.invocations.exists() else ''))
+        self.assertEqual(sorted(p.name for p in self.prefix.iterdir()),['.ownwords-9.8.7','.ownwords-install.json','.ownwords-install.lock','ownwords'])
+        release=self.prefix/'.ownwords-9.8.7'
+        self.assertEqual(sorted(p.relative_to(release).as_posix() for p in release.rglob('*') if p.is_file()),['bin/ownwords.js','package.json'])
+        self.assertEqual(list(self.home.iterdir()),[])
+        # Positive control: the installed launcher runs the payload, and the payload records the invocation.
+        version=subprocess.run([str(self.prefix/'ownwords'),'--version'],env=self.env,text=True,capture_output=True,timeout=30)
+        self.assertEqual(version.returncode,0,version.stdout+version.stderr)
+        self.assertIn('ownwords v9.8.7',version.stdout)
+        self.assertEqual([json.loads(line) for line in self.invocations.read_text().splitlines()],[['--version']])
+
+    def test_rejects_removed_dormant_core_option(self):
+        result=self.run_installer('--no-dormant-core')
+        self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+        self.assertIn('unrecognized arguments: --no-dormant-core',result.stderr)
+        self.assertFalse(self.prefix.exists())
+        self.assertFalse((self.root/'curl.args').exists())
 
     def test_refuses_foreign_launcher_and_symlink_prefix(self):
         self.prefix.mkdir();target=self.prefix/'ownwords';target.write_text('foreign')
@@ -89,7 +116,7 @@ class CurlInstaller(unittest.TestCase):
                 else:item.size=4
                 tar.addfile(item,None if case=='symlink' else io.BytesIO(b'test'))
                 if case=='duplicate':tar.addfile(item,io.BytesIO(b'test'))
-            self.installer.write_text((ROOT/'packages/install.sh').read_text().replace('@VERSION@','9.8.7').replace('@ARCHIVE_SHA256@',hashlib.sha256(self.archive.read_bytes()).hexdigest()))
+            self.bind_installer()
             result=self.run_installer()
             self.assertNotEqual(result.returncode,0)
             self.assertFalse((self.prefix/'ownwords').exists())

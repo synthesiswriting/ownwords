@@ -33,3 +33,13 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+  ci:
+    # The one check branch protection requires on main: it runs after every other job, even when one fails, and passes
+    # only when all of them passed, so the matrix can change without touching the repository's settings.
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: test "${{ needs.test.result }}" = success
